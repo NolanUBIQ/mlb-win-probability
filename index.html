@@ -13580,23 +13580,37 @@ V,22,2,5,3rd,0,1,1,1.0
     return { wins: wins, total: total, winPct: total ? wins / total : -1 };
   }
 
-  function getHomeWp(inning, isBottom, outs, runners, scoreDiff){
+  const MIN_SAMPLES = 30; // minimum historical games before trusting a cell on its own
+
+  function getHomeWp(inning, isBottom, outs, runners, scoreDiff, minSamples){
+    if (minSamples === undefined) minSamples = MIN_SAMPLES;
     const team = isBottom ? "H" : "V";
-    const r = getWinProb(team, inning, outs, runners, scoreDiff);
+    const exact = getWinProb(team, inning, outs, runners, scoreDiff);
+
     let wp;
-    if (r.winPct >= 0){
-      wp = r.winPct;
+    if (exact.winPct >= 0 && exact.total >= minSamples){
+      wp = exact.winPct;
     } else {
+      // Exact cell is too thin (or empty) to trust on its own — pool it with
+      // the nearest neighboring score-diffs (same inning/outs/runners),
+      // expanding outward symmetrically, until the combined sample clears
+      // the threshold or the table runs out of data.
       const clamped = Math.max(TABLE.minDiff, Math.min(TABLE.maxDiff, scoreDiff));
-      const direction = clamped > 0 ? -1 : 1;
-      wp = 0.5;
-      const range = Math.abs(clamped) + Math.abs(TABLE.minDiff) + 2;
-      for (let delta = 0; delta < range; delta++){
-        const trial = clamped + direction * delta;
-        const r2 = getWinProb(team, inning, outs, runners, trial);
-        if (r2.winPct >= 0){ wp = r2.winPct; break; }
+      let pooledWins = exact.winPct >= 0 ? exact.wins : 0;
+      let pooledTotal = exact.winPct >= 0 ? exact.total : 0;
+
+      const maxRadius = Math.abs(TABLE.maxDiff - TABLE.minDiff) + 2;
+      let radius = 1;
+      while (pooledTotal < minSamples && radius <= maxRadius){
+        [clamped - radius, clamped + radius].forEach(function(trial){
+          const r = getWinProb(team, inning, outs, runners, trial);
+          if (r.winPct >= 0){ pooledWins += r.wins; pooledTotal += r.total; }
+        });
+        radius++;
       }
+      wp = pooledTotal > 0 ? pooledWins / pooledTotal : 0.5;
     }
+
     return isBottom ? wp : 1 - wp;
   }
 
