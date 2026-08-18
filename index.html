@@ -16689,72 +16689,98 @@ V,9,2,8,loaded,27,0,0,1.0
     const weNeutral = getHomeWp(1, false, 0, runners, 0);
     const projectedWinner = preGameHomeProb >= 0.5 ? "H" : "V";
     const blendDown = preGameHomeProb < weNeutral;
-    let alpha;
+    let alpha, anchorRuns;
     if (!blendDown){
       // Home's own row (is_bottom=true), not the visiting team's row that's
       // actually batting at true game start — this is structural, not a
       // data-coverage workaround: at the true top of the 1st, home hasn't
-      // batted yet, so "home up 1" can never be represented from the
+      // batted yet, so "home up N" can never be represented from the
       // visitor's own row (the visitor can never be behind before home's
       // first at-bat). That lookup would fall through to the
       // nearest-populated fallback and land back on weNeutral, making scale
       // <= 0 and alpha silently collapse to 0. winProbability mirrors this
       // same special case (see its anchorIsBottom logic) so live evaluation
       // at true game start matches exactly what alpha was calibrated against.
-      const weAnchor = getHomeWp(1, true, 0, runners, 1);
+      //
+      // anchorRuns is 1 unless the pre-game odds are more extreme than the
+      // +1 anchor itself can reach without alpha exceeding 1 — then it
+      // becomes 2, capped there, so the anchor is always a real reference
+      // point rather than a linear extrapolation past it.
+      let weAnchor = getHomeWp(1, true, 0, runners, 1);
+      anchorRuns = 1;
+      if (preGameHomeProb > weAnchor){
+        anchorRuns = 2;
+        weAnchor = getHomeWp(1, true, 0, runners, 2);
+      }
       const scale = weAnchor - weNeutral;
       alpha = scale <= 0 ? 0 : (preGameHomeProb - weNeutral) / scale;
     } else {
-      const weAnchor = getHomeWp(1, false, 0, runners, -1);
+      let weAnchor = getHomeWp(1, false, 0, runners, -1);
+      anchorRuns = 1;
+      if (preGameHomeProb < weAnchor){
+        anchorRuns = 2;
+        weAnchor = getHomeWp(1, false, 0, runners, -2);
+      }
       const scale = weNeutral - weAnchor;
       alpha = scale <= 0 ? 0 : (weNeutral - preGameHomeProb) / scale;
     }
-    return { alpha: alpha, projectedWinner: projectedWinner, blendDown: blendDown };
+    return { alpha: alpha, projectedWinner: projectedWinner, blendDown: blendDown, anchorRuns: anchorRuns };
   }
 
   function winProbability(state, preGameHomeProb, alphaInfo){
     const info = alphaInfo || computeAlpha(preGameHomeProb);
-    const alpha = info.alpha, blendDown = info.blendDown;
+    const alpha = info.alpha, blendDown = info.blendDown, anchorRuns = info.anchorRuns;
     const runners = runnersCode(state.onFirst, state.onSecond, state.onThird);
     const scoreDiff = state.homeScore - state.awayScore;
 
     const weCurrent = getHomeWp(state.inning, state.isBottom, state.outs, runners, scoreDiff);
-    // Anchor from the batting team's own row, at the SAME outs/runners as
-    // the current state, EXCEPT top of the 1st while the visitor is still
-    // scoreless, when anchoring toward a home-team edge (blendDown=false):
-    // the home team hasn't batted yet, so "home up N+1" can never be
-    // represented from the visitor's own row there at ANY outs/runners.
-    //
-    // In that one situation, don't just swap to the home row while still
-    // varying outs/runners with the current state — that compares the
-    // visitor's situational improvement (e.g. advancing a runner) against
-    // an unrelated home-referenced number, and since ANY runners/outs
-    // improvement looks better from whichever row it's evaluated on, it
-    // makes weAnchor move in the SAME direction as weCurrent instead of
-    // tracking a fixed team-quality offset — inverting the sign of
-    // situational deltas once alpha is large enough to dominate (confirmed:
-    // at -205 pre-game odds a triple showed a NEGATIVE delta for the
-    // batting team). Freeze the anchor at the same fixed reference point
-    // computeAlpha calibrated against (0 outs, empty bases) instead of
-    // re-querying it with the current outs/runners.
-    const anchorDiff = blendDown ? scoreDiff - 1 : scoreDiff + 1;
-    const useFixedAnchor = state.inning === 1 && !state.isBottom && !blendDown && state.awayScore === 0;
-    const anchorIsBottom = useFixedAnchor ? true : state.isBottom;
-    const anchorOuts = useFixedAnchor ? 0 : state.outs;
-    const anchorRunners = useFixedAnchor ? runnersCode(false, false, false) : runners;
-    const weAnchor = getHomeWp(state.inning, anchorIsBottom, anchorOuts, anchorRunners, anchorDiff);
 
     const done = outsCompleted(state.inning, state.isBottom, state.outs);
     const progress = Math.min(done / TOTAL_OUTS, 1);
     const alphaN = alpha * (1 - progress);
 
-    let adjusted = (1 - alphaN) * weCurrent + alphaN * weAnchor;
-    adjusted = Math.max(0.01, Math.min(0.99, adjusted));
+    const useFixedCorrection = state.inning === 1 && !state.isBottom && !blendDown && state.awayScore === 0;
 
-    // Must use the SAME anchorIsBottom/anchorOuts/anchorRunners as weAnchor
-    // itself, not the live state.isBottom/state.outs/runners.
-    const currentN = sampleSizeAt(state.inning, state.isBottom, state.outs, runners, scoreDiff);
-    const anchorN = sampleSizeAt(state.inning, anchorIsBottom, anchorOuts, anchorRunners, anchorDiff);
+    let adjusted, currentN, anchorN;
+    if (useFixedCorrection){
+      // Top of the 1st, home favored, visitor still scoreless: "home up
+      // anchorRuns" can never be represented from the visitor's own row at
+      // ANY outs/runners (the visitor can't be behind before home's first
+      // at-bat). Swapping to the home row while still letting outs/runners
+      // vary with the live state doesn't work either — since ANY
+      // situational improvement looks better from whichever row it's
+      // evaluated on, weAnchor would move in the SAME direction as
+      // weCurrent instead of tracking a fixed team-quality offset,
+      // inverting the sign of situational deltas once alpha is large
+      // enough to dominate (confirmed: a triple showed a NEGATIVE delta at
+      // -205 pre-game odds). Freezing the anchor's outs/runners fixes that
+      // sign inversion, but at the cost of damping weCurrent's own
+      // contribution to only (1 - alphaN) of the blend — situational
+      // changes ended up under-reactive.
+      //
+      // Fix: don't blend weCurrent toward a frozen anchor at all — treat
+      // the pre-game edge as a fixed, decaying ADDITIVE correction on top
+      // of the full, undamped weCurrent instead. Still reproduces
+      // preGameHomeProb exactly at true game start (weCurrent == weNeutral,
+      // progress == 0), still decays to 0 on the same schedule, but every
+      // situational change now passes through weCurrent at full weight.
+      const empty = runnersCode(false, false, false);
+      const weNeutralRef = getHomeWp(1, false, 0, empty, 0);
+      const weAnchorFixed = getHomeWp(1, true, 0, empty, anchorRuns);
+      const correction = alpha * (weAnchorFixed - weNeutralRef);
+      adjusted = weCurrent + correction * (1 - progress);
+
+      currentN = sampleSizeAt(state.inning, state.isBottom, state.outs, runners, scoreDiff);
+      anchorN = sampleSizeAt(1, true, 0, empty, anchorRuns);
+    } else {
+      const anchorDiff = blendDown ? scoreDiff - anchorRuns : scoreDiff + anchorRuns;
+      const weAnchor = getHomeWp(state.inning, state.isBottom, state.outs, runners, anchorDiff);
+      adjusted = (1 - alphaN) * weCurrent + alphaN * weAnchor;
+
+      currentN = sampleSizeAt(state.inning, state.isBottom, state.outs, runners, scoreDiff);
+      anchorN = sampleSizeAt(state.inning, state.isBottom, state.outs, runners, anchorDiff);
+    }
+    adjusted = Math.max(0.01, Math.min(0.99, adjusted));
     const sampleSize = Math.min(currentN, anchorN);
 
     return { weHomeWp: weCurrent, adjustedHomeWp: adjusted, alphaCurrent: alphaN, gameProgress: progress, sampleSize: sampleSize };
