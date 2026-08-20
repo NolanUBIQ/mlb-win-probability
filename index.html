@@ -16706,13 +16706,30 @@ V,9,2,8,loaded,27,0,0,1.0
       // +1 anchor itself can reach without alpha exceeding 1 — then it
       // becomes 2, capped there, so the anchor is always a real reference
       // point rather than a linear extrapolation past it.
+      //
+      // scale is measured against weNeutralBottom (home's OWN tied-game
+      // baseline, is_bottom=true), not weNeutral (the visitor's, is_bottom=
+      // false) -- even though the numerator above still measures the gap
+      // from the true pre-game moment (weNeutral). Those two neutrals
+      // aren't the same number: reaching a scoreless bottom of the 1st is
+      // itself a mild positive signal for home (their pitcher just held the
+      // visitors scoreless), so home's own tied-game baseline sits a few
+      // points above the true game-start baseline. Scaling against the
+      // wrong (smaller) baseline made alpha too small for how a 1-run lead
+      // is actually weighted once winProbability blends against it from
+      // home's own row (bottom of the 1st onward) -- this was the actual
+      // root cause of a real bug: an OUT could show a POSITIVE win-
+      // probability delta for the batting team right at the top-of-1st/
+      // bottom-of-1st transition, at some pre-game odds. See live_wp.py's
+      // compute_alpha docstring (Coda 4) for the full derivation.
+      const weNeutralBottom = getHomeWp(1, true, 0, runners, 0);
       let weAnchor = getHomeWp(1, true, 0, runners, 1);
       anchorRuns = 1;
-      if (preGameHomeProb > weAnchor){
+      if (preGameHomeProb > weAnchor - (weNeutralBottom - weNeutral)){
         anchorRuns = 2;
         weAnchor = getHomeWp(1, true, 0, runners, 2);
       }
-      const scale = weAnchor - weNeutral;
+      const scale = weAnchor - weNeutralBottom;
       alpha = scale <= 0 ? 0 : (preGameHomeProb - weNeutral) / scale;
     } else {
       let weAnchor = getHomeWp(1, false, 0, runners, -1);
@@ -16764,10 +16781,18 @@ V,9,2,8,loaded,27,0,0,1.0
       // preGameHomeProb exactly at true game start (weCurrent == weNeutral,
       // progress == 0), still decays to 0 on the same schedule, but every
       // situational change now passes through weCurrent at full weight.
+      //
+      // correction is computed directly as (preGameHomeProb - weNeutralRef)
+      // rather than via alpha * (weAnchorFixed - weNeutralRef): computeAlpha
+      // now scales alpha against home's OWN neutral (bottom of 1st) rather
+      // than this branch's neutral (top of 1st) -- see computeAlpha's
+      // scale comment -- so that product no longer equals this branch's
+      // required correction. Computing it directly is what actually
+      // guarantees reproducing preGameHomeProb exactly at true game start,
+      // for any alpha scaling computeAlpha uses downstream.
       const empty = runnersCode(false, false, false);
       const weNeutralRef = getHomeWp(1, false, 0, empty, 0);
-      const weAnchorFixed = getHomeWp(1, true, 0, empty, anchorRuns);
-      const correction = alpha * (weAnchorFixed - weNeutralRef);
+      const correction = preGameHomeProb - weNeutralRef;
       adjusted = weCurrent + correction * (1 - progress);
 
       currentN = sampleSizeAt(state.inning, state.isBottom, state.outs, runners, scoreDiff);
@@ -16858,7 +16883,50 @@ V,9,2,8,loaded,27,0,0,1.0
       rows.push({ key: key, label: label, valid: true, newBattingWp: newBattingWp,
                   delta: newBattingWp - currentBattingWp, sampleSize: result.sampleSize });
     }
+    enforceDominanceOrder(rows, currentBattingWp);
     return { currentBattingWp: currentBattingWp, rows: rows };
+  }
+
+  // A home run scores at least as many runs as a triple (plus the batter,
+  // who's already safe rather than standing on 3rd) and strictly more than
+  // a double in every case that matters here -- but winProbability's table
+  // lookup + alpha-blend has no structural reason to preserve that on its
+  // own (each cell is fit/smoothed close to independently), so a thin or
+  // unusual state can show HR <= a lesser hit's WPA. This clamps the
+  // DISPLAYED deltas to respect that dominance without touching the
+  // underlying win-probability model: each outcome's delta is raised
+  // (never lowered) to at least match every strictly-worse outcome below
+  // it in the chain, then HR is nudged strictly above 2B specifically if
+  // the chain alone left them tied. Ported from atbat_outcomes.py's
+  // _enforce_dominance_order (2026-08-20) -- math only, keep in sync if
+  // that changes.
+  const DOMINANCE_CHAIN = ["HR", "3B", "2B", "1B"];
+  const STRICTLY_ABOVE = { HR: "2B" };  // HR must beat 2B outright, not just tie it
+  const STRICT_MARGIN = 0.001;  // 0.1pp -- enough to survive the UI's 1-decimal rounding
+
+  function enforceDominanceOrder(rows, currentBattingWp){
+    const byKey = {};
+    for (let i = 0; i < rows.length; i++) byKey[rows[i].key] = rows[i];
+
+    function bump(row, newDelta){
+      row.delta = newDelta;
+      row.newBattingWp = currentBattingWp + newDelta;
+    }
+
+    let floor = -Infinity;
+    for (let i = DOMINANCE_CHAIN.length - 1; i >= 0; i--){
+      const row = byKey[DOMINANCE_CHAIN[i]];
+      if (!row || !row.valid) continue;
+      if (row.delta < floor) bump(row, floor);
+      floor = row.delta;
+    }
+
+    Object.keys(STRICTLY_ABOVE).forEach(function(hiKey){
+      const loKey = STRICTLY_ABOVE[hiKey];
+      const hi = byKey[hiKey], lo = byKey[loKey];
+      if (!hi || !lo || !hi.valid || !lo.valid) return;
+      if (hi.delta <= lo.delta) bump(hi, lo.delta + STRICT_MARGIN);
+    });
   }
 
   // ---------- Odds helpers ----------
